@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+from torchvision import transforms, datasets
+from torch.utils.data import DataLoader
+import numpy as np
+from my_vgg import VGG16_Final  # 导入你定义的模型类
+
+
+
+
+class AttackEnv:
+    def __init__(self, model_path, data_dir, img_size=150, mask_size=15):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.img_size = img_size
+        self.mask_size = mask_size
+        self.num_grids = img_size // mask_size  # 150/15 = 10 (共100个格子)
+
+        # 1. 加载你训练好的二分类 VGG16 模型
+        self.model = VGG16_Final(num_classes=2).to(self.device)
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
+        self.model.eval()
+
+        # 2. 预处理：必须与你训练 VGG16 时完全一致
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3)  # 匹配你代码中的 0.5 归一化
+        ])
+
+        # 3. 加载自定义数据集 (FFHQ)
+        self.dataset = datasets.ImageFolder(data_dir, transform=self.transform)
+        self.data_loader = DataLoader(self.dataset, batch_size=1, shuffle=True)
+        self.data_iter = iter(self.data_loader)
+
+        # 4. 初始化扰动向量 (从原仓库 agent.py 移植)
+        # 这里的 NOISE_SD 可以根据需要调整，通常设为 0.1
+        self.mask_noise = torch.randn(3, mask_size, mask_size).to(self.device) * 0.1
+
+    def reset(self):
+        """重置环境，获取一张新图片"""
+        try:
+            self.current_img, self.label = next(self.data_iter)
+        except StopIteration:
+            self.data_iter = iter(self.data_loader)
+            self.current_img, self.label = next(self.data_iter)
+
+        self.current_img = self.current_img.to(self.device)
+        self.label = self.label.to(self.device)
+        self.original_img = self.current_img.clone()
+
+        # 获取初始预测
+        with torch.no_grad():
+            output = self.model(self.current_img)
+            self.initial_pred = torch.argmax(output, dim=1).item()
+        return self.get_state()
+
+    def step(self, action):
+        """执行动作：修改图像的一个区域"""
+        # action 是一个 0 到 99 的整数 (10x10 网格)
+        i = action // self.num_grids
+        j = action % self.num_grids
+        x_min, y_min = i * self.mask_size, j * self.mask_size
+
+        # 应用扰动
+        with torch.no_grad():
+            self.current_img[:, :, x_min:x_min + self.mask_size, y_min:y_min + self.mask_size] += self.mask_noise
+
+            # 重新评估模型
+            output = self.model(self.current_img)
+            new_pred = torch.argmax(output, dim=1).item()
+            conf = torch.softmax(output, dim=1)[0][self.label].item()  # 原始标签的置信度
+
+        # 计算奖励 (Reward Logic)
+        l2_dist = torch.norm(self.current_img - self.original_img).item()
+
+        done = False
+        reward = 0
+
+        if new_pred != self.label:  # 攻击成功
+            reward = 10.0 - l2_dist
+            done = True
+        else:
+            reward = -0.1 - (l2_dist * 0.01)  # 步长惩罚和扰动惩罚
+
+        return self.get_state(), reward, done, {"l2": l2_dist, "pred": new_pred}
+
+    def get_state(self):
+        """提取特征作为 RL 的输入状态"""
+        # 模仿原仓库：提取 VGG 特征层输出 + 展平后的图像 (或其他特征)
+        with torch.no_grad():
+            features = self.model.base.features(self.current_img)
+            features = torch.flatten(features, 1)  # 25088 维
+        return features.cpu().squeeze(0)
